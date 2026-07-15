@@ -10,19 +10,22 @@ import re
 import secrets
 import socket
 from datetime import datetime, timezone
-from typing import Iterable
-from urllib.parse import urlparse
+from typing import Any, Iterable
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from openpyxl import Workbook
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
 
-APP_TITLE = "Парсер компаний — Lite"
+APP_TITLE = "Парсер компаний — Яндекс + 2ГИС"
 TWOGIS_URL = "https://catalog.api.2gis.com/3.0/items"
+YANDEX_MAPS_URL = "https://yandex.ru/maps/"
+YANDEX_BROWSER_LOCK = asyncio.Lock()
 
 
 def env(name: str, default: str = "") -> str:
@@ -63,8 +66,9 @@ class Job(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     city: Mapped[str] = mapped_column(String(200))
     categories: Mapped[str] = mapped_column(Text)
-    mode: Mapped[str] = mapped_column(String(30), default="no_site")
-    max_results: Mapped[int] = mapped_column(Integer, default=50)
+    # Совместимость со старой БД: теперь в mode хранится source:filter, например yandex:no_site.
+    mode: Mapped[str] = mapped_column(String(60), default="twogis:no_site")
+    max_results: Mapped[int] = mapped_column(Integer, default=20)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     found_count: Mapped[int] = mapped_column(Integer, default=0)
     saved_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -79,7 +83,7 @@ class Lead(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
-    source_id: Mapped[str] = mapped_column(String(200), default="")
+    source_id: Mapped[str] = mapped_column(Text, default="")
     name: Mapped[str] = mapped_column(String(500))
     category: Mapped[str] = mapped_column(Text, default="")
     address: Mapped[str] = mapped_column(Text, default="")
@@ -142,19 +146,20 @@ def layout(title: str, body: str, request: Request | None = None, refresh: int |
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 {refresh_tag}<title>{esc(title)}</title>
 <style>
-:root {{ color-scheme: dark; --bg:#0e1117; --card:#171b22; --line:#2b313b; --text:#f4f6f8; --muted:#aab2bf; --accent:#7c5cff; --ok:#37c978; --bad:#ff5d6c; }}
+:root {{ color-scheme: dark; --bg:#0e1117; --card:#171b22; --line:#2b313b; --text:#f4f6f8; --muted:#aab2bf; --accent:#7c5cff; --ok:#37c978; --bad:#ff5d6c; --warn:#f6c85f; }}
 * {{ box-sizing:border-box }} body {{ margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif }}
-a {{ color:#a997ff }} .wrap {{ max-width:1180px; margin:0 auto; padding:24px }}
+a {{ color:#a997ff }} .wrap {{ max-width:1260px; margin:0 auto; padding:24px }}
 header {{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px }}
 .card {{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; margin-bottom:18px }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px }}
 label {{ display:block; color:var(--muted); margin-bottom:6px }} input,textarea,select {{ width:100%; background:#0c0f14; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px }}
 textarea {{ min-height:110px; resize:vertical }} button,.button {{ display:inline-block; border:0; border-radius:10px; background:var(--accent); color:white; padding:11px 16px; cursor:pointer; text-decoration:none; font-weight:650 }}
-.secondary {{ background:#29303a }} .danger {{ background:#7a2833 }} table {{ width:100%; border-collapse:collapse; font-size:14px }} th,td {{ text-align:left; vertical-align:top; padding:10px; border-bottom:1px solid var(--line) }} th {{ color:var(--muted) }}
-.badge {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#29303a; font-size:12px }} .ok {{ color:var(--ok) }} .bad {{ color:var(--bad) }} .muted {{ color:var(--muted) }}
+.secondary {{ background:#29303a }} table {{ width:100%; border-collapse:collapse; font-size:14px }} th,td {{ text-align:left; vertical-align:top; padding:10px; border-bottom:1px solid var(--line) }} th {{ color:var(--muted) }}
+.badge {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#29303a; font-size:12px }} .ok {{ color:var(--ok) }} .bad {{ color:var(--bad) }} .warn {{ color:var(--warn) }} .muted {{ color:var(--muted) }}
 pre {{ white-space:pre-wrap; word-break:break-word; background:#0c0f14; padding:12px; border-radius:10px }}
-@media(max-width:700px) {{ .wrap {{ padding:14px }} .table-wrap {{ overflow:auto }} table {{ min-width:850px }} }}
-</style></head><body><div class="wrap"><header><div><h1 style="margin:0">{esc(APP_TITLE)}</h1><div class="muted">2ГИС → лиды → Excel</div></div>{logout}</header>{body}</div></body></html>"""
+.notice {{ border-left:4px solid var(--warn); padding-left:14px }}
+@media(max-width:700px) {{ .wrap {{ padding:14px }} .table-wrap {{ overflow:auto }} table {{ min-width:1050px }} }}
+</style></head><body><div class="wrap"><header><div><h1 style="margin:0">{esc(APP_TITLE)}</h1><div class="muted">Яндекс Карты (браузер) + 2ГИС API → Excel</div></div>{logout}</header>{body}</div></body></html>"""
 
 
 @app.get("/health")
@@ -188,33 +193,74 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+def split_job_mode(raw_mode: str) -> tuple[str, str]:
+    if ":" in raw_mode:
+        source, mode = raw_mode.split(":", 1)
+    else:
+        source, mode = "twogis", raw_mode
+    if source not in {"yandex", "twogis"}:
+        source = "twogis"
+    if mode not in {"all", "no_site", "audit_sites"}:
+        mode = "no_site"
+    return source, mode
+
+
+def source_label(source: str) -> str:
+    return "Яндекс Карты" if source == "yandex" else "2ГИС"
+
+
+def mode_label(mode: str) -> str:
+    return {
+        "all": "Все карточки",
+        "no_site": "Без сайта + есть контакт",
+        "audit_sites": "Сайт есть — аудит",
+    }.get(mode, mode)
+
+
 def status_badge(status: str) -> str:
     labels = {"pending": "ожидает", "running": "работает", "done": "готово", "failed": "ошибка"}
     cls = "ok" if status == "done" else "bad" if status == "failed" else ""
     return f'<span class="badge {cls}">{esc(labels.get(status, status))}</span>'
 
 
+def lead_source(lead: Lead) -> tuple[str, str]:
+    if lead.source_id.startswith("yandex:"):
+        return "Яндекс", lead.source_id[len("yandex:") :]
+    if lead.source_id.startswith("2gis:"):
+        return "2ГИС", ""
+    return "2ГИС", ""
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
     require_login(request)
     jobs = list(db.scalars(select(Job).order_by(Job.id.desc()).limit(100)).all())
-    rows = "".join(
-        f"<tr><td><a href='/jobs/{j.id}'>#{j.id}</a></td><td>{esc(j.city)}</td><td>{esc(j.categories)}</td><td>{'Без сайта' if j.mode == 'no_site' else 'Аудит сайтов'}</td><td>{status_badge(j.status)}</td><td>{j.saved_count}</td></tr>"
-        for j in jobs
-    ) or '<tr><td colspan="6" class="muted">Задач пока нет</td></tr>'
+    rows_parts: list[str] = []
+    for job in jobs:
+        source, mode = split_job_mode(job.mode)
+        rows_parts.append(
+            f"<tr><td><a href='/jobs/{job.id}'>#{job.id}</a></td><td>{esc(job.city)}</td>"
+            f"<td>{esc(job.categories)}</td><td>{esc(source_label(source))}</td><td>{esc(mode_label(mode))}</td>"
+            f"<td>{status_badge(job.status)}</td><td>{job.saved_count}</td></tr>"
+        )
+    rows = "".join(rows_parts) or '<tr><td colspan="7" class="muted">Задач пока нет</td></tr>'
     settings = f"""<div class="card"><h2>Состояние подключения</h2><div class="grid">
+<div>Яндекс без API: <b class="ok">готов</b> <span class="muted">(эксперимент)</span></div>
 <div>Ключ 2ГИС: <b class="{'ok' if TWOGIS_API_KEY else 'bad'}">{'есть' if TWOGIS_API_KEY else 'не задан'}</b></div>
-<div>Сохранение данных разрешено: <b class="{'ok' if DATA_LICENSE_ACKNOWLEDGED else 'bad'}">{'да' if DATA_LICENSE_ACKNOWLEDGED else 'нет'}</b></div>
+<div>Сохранение данных 2ГИС разрешено: <b class="{'ok' if DATA_LICENSE_ACKNOWLEDGED else 'bad'}">{'да' if DATA_LICENSE_ACKNOWLEDGED else 'нет'}</b></div>
 <div>Telegram: <b class="{'ok' if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID else 'muted'}">{'настроен' if TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID else 'не настроен'}</b></div>
 </div></div>"""
+    notice = """<div class="card notice"><b>Яндекс-режим работает браузером без API.</b>
+Он собирает только видимые данные, не обходит CAPTCHA и остановится, если Яндекс запросит подтверждение. Для первого теста поставь одну категорию и максимум 5–10.</div>"""
     form = """<div class="card"><h2>Новый поиск</h2><form method="post" action="/jobs">
-<div class="grid"><div><label>Город</label><input name="city" placeholder="Москва" required></div>
-<div><label>Режим</label><select name="mode"><option value="no_site">Без сайта, но с контактами</option><option value="audit_sites">Есть сайт — сделать технический аудит</option></select></div>
-<div><label>Максимум на категорию</label><input name="max_results" type="number" min="1" max="100" value="30"></div></div>
+<div class="grid"><div><label>Город</label><input name="city" placeholder="Воронеж" required></div>
+<div><label>Источник</label><select name="source"><option value="yandex" selected>Яндекс Карты — без API</option><option value="twogis">2ГИС API</option></select></div>
+<div><label>Режим</label><select name="mode"><option value="all">Все карточки — для проверки</option><option value="no_site" selected>Без сайта, но с контактом</option><option value="audit_sites">Есть сайт — технический аудит</option></select></div>
+<div><label>Максимум на категорию</label><input name="max_results" type="number" min="1" max="30" value="10"></div></div>
 <div style="height:14px"></div><label>Категории — через запятую или каждую с новой строки</label>
 <textarea name="categories" placeholder="стоматология&#10;автосервис&#10;салон красоты" required></textarea><div style="height:14px"></div><button>Запустить поиск</button></form></div>"""
-    history = f"""<div class="card"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Город</th><th>Категории</th><th>Режим</th><th>Статус</th><th>Лидов</th></tr></thead><tbody>{rows}</tbody></table></div></div>"""
-    return layout("Панель", settings + form + history, request)
+    history = f"""<div class="card"><h2>История</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Город</th><th>Категории</th><th>Источник</th><th>Режим</th><th>Статус</th><th>Лидов</th></tr></thead><tbody>{rows}</tbody></table></div></div>"""
+    return layout("Панель", settings + notice + form + history, request)
 
 
 @app.post("/jobs")
@@ -223,19 +269,25 @@ def create_job(
     background_tasks: BackgroundTasks,
     city: str = Form(...),
     categories: str = Form(...),
+    source: str = Form("yandex"),
     mode: str = Form("no_site"),
-    max_results: int = Form(30),
+    max_results: int = Form(10),
     db: Session = Depends(get_db),
 ):
     require_login(request)
     category_list = [x.strip() for x in re.split(r"[,\n]+", categories) if x.strip()]
     if not category_list:
         raise HTTPException(400, "Укажи хотя бы одну категорию")
+    source = "yandex" if source == "yandex" else "twogis"
+    mode = mode if mode in {"all", "no_site", "audit_sites"} else "no_site"
+    category_limit = 12 if source == "yandex" else 30
+    category_list = list(dict.fromkeys(category_list))[:category_limit]
+    per_category_limit = max(1, min(30 if source == "yandex" else 100, max_results))
     job = Job(
         city=city.strip(),
-        categories="\n".join(dict.fromkeys(category_list)),
-        mode="audit_sites" if mode == "audit_sites" else "no_site",
-        max_results=max(1, min(100, max_results)),
+        categories="\n".join(category_list),
+        mode=f"{source}:{mode}",
+        max_results=per_category_limit,
     )
     db.add(job)
     db.commit()
@@ -250,22 +302,29 @@ def job_page(job_id: int, request: Request, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Задача не найдена")
+    source, mode = split_job_mode(job.mode)
     leads = list(db.scalars(select(Lead).where(Lead.job_id == job_id).order_by(Lead.id)).all())
     rows = ""
     for lead in leads:
+        lead_source_name, card_url = lead_source(lead)
         score = "—" if lead.audit_score is None else str(lead.audit_score)
         site = f'<a href="{esc(lead.website)}" target="_blank" rel="noopener">открыть</a>' if lead.website else "—"
-        rows += f"""<tr><td>{esc(lead.name)}</td><td>{esc(lead.category)}</td><td>{esc(lead.address)}</td>
-<td>{esc(lead.phones)}</td><td>{esc(lead.emails)}</td><td>{site}</td><td>{esc(lead.rating)}</td><td>{score}</td><td>{esc(lead.audit_notes or '')}</td></tr>"""
+        card = f'<a href="{esc(card_url)}" target="_blank" rel="noopener">карточка</a>' if card_url else "—"
+        rows += f"""<tr><td>{esc(lead_source_name)}</td><td>{esc(lead.name)}</td><td>{esc(lead.category)}</td><td>{esc(lead.address)}</td>
+<td>{esc(lead.phones)}</td><td>{esc(lead.emails)}</td><td>{site}</td><td>{card}</td><td>{esc(lead.rating)}</td><td>{score}</td><td>{esc(lead.audit_notes or '')}</td></tr>"""
     if not rows:
-        rows = '<tr><td colspan="9" class="muted">Пока нет результатов</td></tr>'
-    error = f'<div class="card"><h3 class="bad">Ошибка</h3><pre>{esc(job.error)}</pre></div>' if job.error else ""
-    refresh = 4 if job.status in {"pending", "running"} else None
+        rows = '<tr><td colspan="11" class="muted">Нет карточек, прошедших выбранный фильтр. Смотри диагностику выше.</td></tr>'
+    diagnostic = ""
+    if job.error:
+        heading = "Ошибка" if job.status == "failed" else "Диагностика"
+        cls = "bad" if job.status == "failed" else "warn"
+        diagnostic = f'<div class="card"><h3 class="{cls}">{heading}</h3><pre>{esc(job.error)}</pre></div>'
+    refresh = 5 if job.status in {"pending", "running"} else None
     body = f"""<div class="card"><a href="/">← Назад</a><h2>Задача #{job.id}</h2>
-<div class="grid"><div>Город: <b>{esc(job.city)}</b></div><div>Статус: {status_badge(job.status)}</div><div>Найдено: <b>{job.found_count}</b></div><div>Сохранено: <b>{job.saved_count}</b></div></div>
+<div class="grid"><div>Город: <b>{esc(job.city)}</b></div><div>Источник: <b>{esc(source_label(source))}</b></div><div>Режим: <b>{esc(mode_label(mode))}</b></div><div>Статус: {status_badge(job.status)}</div><div>Получено карточек: <b>{job.found_count}</b></div><div>Сохранено: <b>{job.saved_count}</b></div></div>
 <p class="muted">{esc(job.categories).replace(chr(10), ', ')}</p>
-<a class="button" href="/jobs/{job.id}/export.xlsx">Скачать Excel</a></div>{error}
-<div class="card"><div class="table-wrap"><table><thead><tr><th>Компания</th><th>Категория</th><th>Адрес</th><th>Телефоны</th><th>Email</th><th>Сайт</th><th>Рейтинг</th><th>Оценка</th><th>Что не так</th></tr></thead><tbody>{rows}</tbody></table></div></div>"""
+<a class="button" href="/jobs/{job.id}/export.xlsx">Скачать Excel</a></div>{diagnostic}
+<div class="card"><div class="table-wrap"><table><thead><tr><th>Источник</th><th>Компания</th><th>Категория</th><th>Адрес</th><th>Телефоны</th><th>Email</th><th>Сайт</th><th>Карточка</th><th>Рейтинг</th><th>Оценка</th><th>Что не так</th></tr></thead><tbody>{rows}</tbody></table></div></div>"""
     return layout(f"Задача #{job.id}", body, request, refresh)
 
 
@@ -279,10 +338,11 @@ def export_job(job_id: int, request: Request, db: Session = Depends(get_db)):
     wb = Workbook()
     ws = wb.active
     ws.title = "Лиды"
-    headers = ["Компания", "Категория", "Адрес", "Телефоны", "Email", "Мессенджеры", "Сайт", "Рейтинг", "Оценка сайта", "Проблемы", "Черновик обращения"]
+    headers = ["Источник", "Компания", "Категория", "Адрес", "Телефоны", "Email", "Мессенджеры", "Сайт", "Карточка на картах", "Рейтинг", "Оценка сайта", "Проблемы", "Черновик обращения"]
     ws.append(headers)
     for lead in leads:
-        ws.append([lead.name, lead.category, lead.address, lead.phones, lead.emails, lead.messengers, lead.website or "", lead.rating, lead.audit_score, lead.audit_notes or "", lead.draft_text or ""])
+        source_name, card_url = lead_source(lead)
+        ws.append([source_name, lead.name, lead.category, lead.address, lead.phones, lead.emails, lead.messengers, lead.website or "", card_url, lead.rating, lead.audit_score, lead.audit_notes or "", lead.draft_text or ""])
     for col in ws.columns:
         width = min(55, max(12, max(len(str(cell.value or "")) for cell in col) + 2))
         ws.column_dimensions[col[0].column_letter].width = width
@@ -305,7 +365,7 @@ def normalize_phone(value: str) -> str:
     digits = re.sub(r"\D", "", value)
     if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
-    return "+" + digits if digits else ""
+    return "+" + digits if len(digits) >= 10 else ""
 
 
 def normalize_url(value: str) -> str:
@@ -317,7 +377,7 @@ def normalize_url(value: str) -> str:
     return value
 
 
-def parse_company(item: dict, city: str, fallback_category: str) -> dict:
+def parse_company(item: dict[str, Any], city: str, fallback_category: str) -> dict[str, Any]:
     phones: list[str] = []
     emails: list[str] = []
     messengers: list[str] = []
@@ -342,7 +402,8 @@ def parse_company(item: dict, city: str, fallback_category: str) -> dict:
     except (TypeError, ValueError):
         rating = None
     return {
-        "source_id": str(item.get("id") or ""),
+        "source": "2gis",
+        "source_id": "2gis:" + str(item.get("id") or ""),
         "name": str(item.get("name") or "Без названия"),
         "category": category,
         "address": str(item.get("full_address_name") or item.get("address_name") or city),
@@ -354,21 +415,22 @@ def parse_company(item: dict, city: str, fallback_category: str) -> dict:
     }
 
 
-async def search_twogis(city: str, category: str, has_site: bool, limit: int) -> list[dict]:
+async def search_twogis(city: str, category: str, has_site: bool | None, limit: int) -> list[dict[str, Any]]:
     page_size = min(50, limit)
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=25) as client:
         page = 1
         while len(results) < limit:
-            params = {
+            params: dict[str, Any] = {
                 "q": f"{category} {city}",
                 "type": "branch",
-                "has_site": str(has_site).lower(),
                 "page": page,
                 "page_size": page_size,
                 "fields": "items.contact_groups,items.rubrics,items.reviews,items.full_address_name",
                 "key": TWOGIS_API_KEY,
             }
+            if has_site is not None:
+                params["has_site"] = str(has_site).lower()
             response = await client.get(TWOGIS_URL, params=params)
             if response.status_code >= 400:
                 detail = response.text[:500]
@@ -381,6 +443,306 @@ async def search_twogis(city: str, category: str, has_site: bool, limit: int) ->
                 break
             page += 1
     return results[:limit]
+
+
+def yandex_captcha_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in ["проверка, что вы не робот", "подтвердите, что запросы отправляли вы", "введите символы", "captcha"])
+
+
+async def page_has_captcha(page: Page) -> bool:
+    if "captcha" in page.url.lower() or "showcaptcha" in page.url.lower():
+        return True
+    try:
+        text = await page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return False
+    return yandex_captcha_text(text[:8000])
+
+
+async def close_yandex_popups(page: Page) -> None:
+    for label in ["Принять", "Хорошо", "Понятно", "Закрыть", "Не сейчас"]:
+        try:
+            button = page.get_by_role("button", name=re.compile(label, re.I)).first
+            if await button.count() and await button.is_visible():
+                await button.click(timeout=1500)
+                await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+
+def canonical_yandex_org_url(base_url: str, href: str) -> str:
+    absolute = urljoin(base_url, href)
+    parsed = urlparse(absolute)
+    if "/org/" not in parsed.path:
+        return ""
+    return urlunparse((parsed.scheme or "https", parsed.netloc or "yandex.ru", parsed.path.rstrip("/"), "", "", ""))
+
+
+async def collect_yandex_org_links(page: Page, limit: int) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+    stable_rounds = 0
+    for _ in range(35):
+        try:
+            hrefs = await page.locator('a[href*="/org/"]').evaluate_all("els => els.map(e => e.getAttribute('href')).filter(Boolean)")
+        except Exception:
+            hrefs = []
+        before = len(links)
+        for href in hrefs:
+            url = canonical_yandex_org_url(page.url, str(href))
+            if url and url not in seen:
+                seen.add(url)
+                links.append(url)
+                if len(links) >= limit:
+                    return links
+        stable_rounds = stable_rounds + 1 if len(links) == before else 0
+        if stable_rounds >= 5:
+            break
+        scrolled = False
+        for selector in ['[class*="scroll__container"]', '[class*="search-list-view"]', '[class*="search-list-view__list"]']:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    await locator.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                    scrolled = True
+                    break
+            except Exception:
+                pass
+        if not scrolled:
+            await page.mouse.wheel(0, 1800)
+        await page.wait_for_timeout(900)
+        if await page_has_captcha(page):
+            raise RuntimeError("Яндекс показал CAPTCHA. Автоматический обход отключён; повтори позже или запускай меньший объём.")
+    return links[:limit]
+
+
+def walk_json(value: Any) -> Iterable[Any]:
+    yield value
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from walk_json(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from walk_json(nested)
+
+
+def jsonld_org_data(values: list[Any]) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for value in values:
+        for nested in walk_json(value):
+            if not isinstance(nested, dict):
+                continue
+            kind = nested.get("@type")
+            kinds = [str(x) for x in kind] if isinstance(kind, list) else [str(kind or "")]
+            if any("organization" in k.lower() or "business" in k.lower() or "store" in k.lower() or "restaurant" in k.lower() for k in kinds):
+                candidates.append(nested)
+    return max(candidates, key=lambda x: len(x), default={})
+
+
+def format_address(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, dict):
+        return ""
+    fields = [value.get("addressLocality"), value.get("streetAddress"), value.get("postalCode")]
+    return ", ".join(str(x).strip() for x in fields if x)
+
+
+def external_target(href: str) -> str:
+    if not href:
+        return ""
+    absolute = unquote(href)
+    parsed = urlparse(absolute)
+    if parsed.netloc.endswith("yandex.ru") or parsed.netloc.endswith("yandex.com"):
+        query = parse_qs(parsed.query)
+        target = (query.get("url") or query.get("target") or [""])[0]
+        if target:
+            absolute = unquote(target)
+            parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if not host or host.endswith("yandex.ru") or host.endswith("yandex.com") or host.endswith("ya.ru"):
+        return ""
+    return absolute
+
+
+async def first_text(page: Page, selectors: list[str]) -> str:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() and await locator.is_visible():
+                text = (await locator.inner_text(timeout=1500)).strip()
+                if text:
+                    return re.sub(r"\s+", " ", text)
+        except Exception:
+            pass
+    return ""
+
+
+async def extract_yandex_card(page: Page, card_url: str, fallback_category: str, city: str) -> dict[str, Any]:
+    await page.goto(card_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2200)
+    await close_yandex_popups(page)
+    if await page_has_captcha(page):
+        raise RuntimeError("Яндекс показал CAPTCHA при открытии карточки. Обход CAPTCHA отключён.")
+
+    for selector in ['button:has-text("Показать телефон")', '[role="button"]:has-text("Показать телефон")', '[class*="card-phones-view__more"]']:
+        try:
+            button = page.locator(selector).first
+            if await button.count() and await button.is_visible():
+                await button.click(timeout=1800)
+                await page.wait_for_timeout(400)
+                break
+        except Exception:
+            pass
+
+    json_values: list[Any] = []
+    try:
+        scripts = await page.locator('script[type="application/ld+json"]').all_text_contents()
+        for raw in scripts:
+            try:
+                json_values.append(json.loads(raw))
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
+    structured = jsonld_org_data(json_values)
+
+    name = str(structured.get("name") or "").strip()
+    if not name:
+        name = await first_text(page, ['h1', '[class*="orgpage-header-view__header"]', '[class*="business-card-title-view__title"]'])
+    if not name:
+        title = await page.title()
+        name = re.split(r"\s+[—–-]\s+", title, maxsplit=1)[0].strip()
+
+    address = format_address(structured.get("address"))
+    if not address:
+        address = await first_text(page, ['[class*="business-contacts-view__address-link"]', '[class*="orgpage-header-view__address"]', '[class*="business-card-title-view__address"]', '[itemprop="address"]'])
+
+    category = await first_text(page, ['[class*="business-card-title-view__categories"]', '[class*="orgpage-header-view__category"]', '[class*="orgpage-categories-info-view"]'])
+    category = category or fallback_category
+
+    phones: list[str] = []
+    telephone = structured.get("telephone")
+    if isinstance(telephone, list):
+        phones.extend(normalize_phone(str(x)) for x in telephone)
+    elif telephone:
+        phones.append(normalize_phone(str(telephone)))
+    try:
+        tel_hrefs = await page.locator('a[href^="tel:"]').evaluate_all("els => els.map(e => e.getAttribute('href')).filter(Boolean)")
+        phones.extend(normalize_phone(str(x).removeprefix("tel:")) for x in tel_hrefs)
+    except Exception:
+        pass
+
+    emails: list[str] = []
+    email = structured.get("email")
+    if isinstance(email, list):
+        emails.extend(str(x).lower().strip() for x in email)
+    elif email:
+        emails.append(str(email).lower().strip())
+    try:
+        mail_hrefs = await page.locator('a[href^="mailto:"]').evaluate_all("els => els.map(e => e.getAttribute('href')).filter(Boolean)")
+        emails.extend(str(x).removeprefix("mailto:").split("?", 1)[0].lower() for x in mail_hrefs)
+    except Exception:
+        pass
+
+    websites: list[str] = []
+    structured_url = structured.get("url")
+    if isinstance(structured_url, str):
+        target = external_target(structured_url)
+        if target:
+            websites.append(target)
+    for selector in ['a[class*="business-urls-view__link"]', 'a[class*="business-contacts-view__website"]', 'a[data-type="website"]', 'a[aria-label*="сайт" i]']:
+        try:
+            hrefs = await page.locator(selector).evaluate_all("els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean)")
+            for href in hrefs:
+                target = external_target(str(href))
+                if target:
+                    websites.append(target)
+        except Exception:
+            pass
+
+    messengers: list[str] = []
+    try:
+        hrefs = await page.locator('a[href]').evaluate_all("els => els.map(e => e.href || '').filter(Boolean)")
+        for href in hrefs:
+            target = external_target(str(href))
+            host = (urlparse(target).hostname or "").lower() if target else ""
+            if host in {"t.me", "telegram.me", "wa.me", "api.whatsapp.com", "vk.com", "viber.com"}:
+                messengers.append(target)
+    except Exception:
+        pass
+
+    rating: float | None = None
+    rating_text = await first_text(page, ['[class*="business-summary-rating-badge-view__rating-text"]', '[class*="business-rating-badge-view__rating-text"]', '[aria-label*="Рейтинг"]'])
+    match = re.search(r"\d+[\.,]\d+|\d+", rating_text)
+    if match:
+        try:
+            rating = float(match.group(0).replace(",", "."))
+        except ValueError:
+            pass
+    if rating is None:
+        aggregate = structured.get("aggregateRating")
+        if isinstance(aggregate, dict):
+            try:
+                rating = float(str(aggregate.get("ratingValue") or "").replace(",", "."))
+            except ValueError:
+                pass
+
+    return {
+        "source": "yandex",
+        "source_id": "yandex:" + card_url,
+        "name": name or "Без названия",
+        "category": category,
+        "address": address or city,
+        "phones": clean_list(phones),
+        "emails": clean_list(emails),
+        "messengers": clean_list(messengers),
+        "website": next(iter(clean_list(websites)), None),
+        "rating": rating,
+    }
+
+
+async def search_yandex_categories(city: str, categories: list[str], limit: int) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    async with YANDEX_BROWSER_LOCK:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-zygote",
+                ],
+            )
+            context = await browser.new_context(locale="ru-RU", viewport={"width": 1365, "height": 900})
+            search_page = await context.new_page()
+            detail_page = await context.new_page()
+            try:
+                for category in categories:
+                    search_url = f"{YANDEX_MAPS_URL}?text={quote_plus(category + ' ' + city)}"
+                    await search_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                    await search_page.wait_for_timeout(3500)
+                    await close_yandex_popups(search_page)
+                    if await page_has_captcha(search_page):
+                        raise RuntimeError("Яндекс показал CAPTCHA. Обход отключён; подожди и запусти меньший объём.")
+                    links = await collect_yandex_org_links(search_page, limit)
+                    if not links and "/org/" in search_page.url:
+                        links = [canonical_yandex_org_url(search_page.url, search_page.url)]
+                    for card_url in links:
+                        try:
+                            collected.append(await extract_yandex_card(detail_page, card_url, category, city))
+                        except PlaywrightTimeoutError:
+                            collected.append({"source": "yandex", "source_id": "yandex:" + card_url, "name": "Карточка не загрузилась", "category": category, "address": city, "phones": [], "emails": [], "messengers": [], "website": None, "rating": None})
+                        await detail_page.wait_for_timeout(450)
+            finally:
+                await context.close()
+                await browser.close()
+    return collected
 
 
 def hostname_is_public(hostname: str) -> bool:
@@ -412,7 +774,7 @@ async def audit_site(url: str) -> tuple[int, str]:
         if response.status_code >= 400:
             score -= 40
             issues.append(f"HTTP {response.status_code}")
-        if "name=\"viewport\"" not in lower and "name='viewport'" not in lower:
+        if 'name="viewport"' not in lower and "name='viewport'" not in lower:
             score -= 20
             issues.append("не найдена мобильная адаптация viewport")
         if not re.search(r"<title[^>]*>\s*[^<]{3,}", text, re.I):
@@ -437,11 +799,12 @@ async def audit_site(url: str) -> tuple[int, str]:
     return max(0, score), ", ".join(issues) if issues else "явных технических проблем не найдено"
 
 
-def draft_for(company: dict, score: int | None, notes: str | None) -> str:
+def draft_for(company: dict[str, Any], score: int | None, notes: str | None) -> str:
+    source_name = "Яндекс Картах" if company.get("source") == "yandex" else "2ГИС"
     if company.get("website"):
         problem = notes or "есть возможности для улучшения сайта"
-        return f"Здравствуйте! Посмотрел сайт компании «{company['name']}». Заметил: {problem}. Могу предложить короткий план обновления без обязательств. Кому можно его отправить?"
-    return f"Здравствуйте! Увидел компанию «{company['name']}» в 2ГИС. Заметил, что отдельный сайт не указан. Могу бесплатно набросать структуру простой страницы с услугами и контактами. Кому можно отправить пример?"
+        return f"Здравствуйте! Нашёл компанию «{company['name']}» в {source_name} и посмотрел сайт. Заметил: {problem}. Могу предложить короткий план обновления без обязательств. Кому можно его отправить?"
+    return f"Здравствуйте! Нашёл компанию «{company['name']}» в {source_name}. Отдельный сайт в карточке не указан. Могу бесплатно набросать структуру простой страницы с услугами и контактами. Кому можно отправить пример?"
 
 
 async def telegram_notify(text: str) -> None:
@@ -455,65 +818,95 @@ async def telegram_notify(text: str) -> None:
         pass
 
 
+def deduplicate_and_filter(collected: list[dict[str, Any]], mode: str) -> tuple[list[dict[str, Any]], str]:
+    seen: set[str] = set()
+    unique_all: list[dict[str, Any]] = []
+    for company in collected:
+        key = company.get("source_id") or (str(company.get("name", "")).lower() + "|" + (company.get("phones") or [company.get("address", "")])[0])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_all.append(company)
+
+    with_site = sum(bool(company.get("website")) for company in unique_all)
+    with_contact = sum(bool(company.get("phones") or company.get("emails") or company.get("messengers")) for company in unique_all)
+    no_site_with_contact = sum(not company.get("website") and bool(company.get("phones") or company.get("emails") or company.get("messengers")) for company in unique_all)
+
+    if mode == "all":
+        selected = unique_all
+    elif mode == "audit_sites":
+        selected = [company for company in unique_all if company.get("website")]
+    else:
+        selected = [company for company in unique_all if not company.get("website") and bool(company.get("phones") or company.get("emails") or company.get("messengers"))]
+
+    diagnostic = (
+        f"Получено карточек: {len(collected)}\n"
+        f"Уникальных: {len(unique_all)}\n"
+        f"С доступным сайтом: {with_site}\n"
+        f"С телефоном/email/мессенджером: {with_contact}\n"
+        f"Без сайта, но с контактом: {no_site_with_contact}\n"
+        f"Прошло выбранный фильтр: {len(selected)}"
+    )
+    if not selected and unique_all:
+        diagnostic += "\n\nСовет: запусти режим «Все карточки — для проверки», чтобы увидеть, какие поля реально удалось получить."
+    return selected, diagnostic
+
+
 async def run_job(job_id: int) -> None:
     with SessionLocal() as db:
         job = db.get(Job, job_id)
         if not job:
             return
         job.status = "running"
+        job.error = None
         db.commit()
     try:
-        if not TWOGIS_API_KEY:
-            raise RuntimeError("Не задан TWOGIS_API_KEY в настройках Render")
-        if not DATA_LICENSE_ACKNOWLEDGED:
-            raise RuntimeError("DATA_LICENSE_ACKNOWLEDGED=false. Поставь true только если твой доступ 2ГИС разрешает сохранять данные")
         with SessionLocal() as db:
             job = db.get(Job, job_id)
             if not job:
                 return
             city = job.city
             categories = [x.strip() for x in job.categories.splitlines() if x.strip()]
-            mode = job.mode
+            source, mode = split_job_mode(job.mode)
             limit = job.max_results
-        collected: list[dict] = []
-        for category in categories:
-            companies = await search_twogis(city, category, has_site=(mode == "audit_sites"), limit=limit)
-            collected.extend(companies)
-        seen: set[str] = set()
-        unique: list[dict] = []
-        for company in collected:
-            key = company["source_id"] or (company["name"].lower() + "|" + (company["phones"][0] if company["phones"] else company["address"].lower()))
-            if key in seen:
-                continue
-            seen.add(key)
-            has_contact = bool(company["phones"] or company["emails"] or company["messengers"])
-            if mode == "no_site" and (company["website"] or not has_contact):
-                continue
-            if mode == "audit_sites" and not company["website"]:
-                continue
-            unique.append(company)
+
+        collected: list[dict[str, Any]] = []
+        if source == "twogis":
+            if not TWOGIS_API_KEY:
+                raise RuntimeError("Не задан TWOGIS_API_KEY в настройках Render")
+            if not DATA_LICENSE_ACKNOWLEDGED:
+                raise RuntimeError("DATA_LICENSE_ACKNOWLEDGED=false. Поставь true только если твой доступ 2ГИС разрешает сохранять данные")
+            has_site = True if mode == "audit_sites" else False if mode == "no_site" else None
+            for category in categories:
+                collected.extend(await search_twogis(city, category, has_site=has_site, limit=limit))
+        else:
+            collected = await search_yandex_categories(city, categories, limit=min(30, limit))
+
+        selected, diagnostic = deduplicate_and_filter(collected, mode)
         with SessionLocal() as db:
             job = db.get(Job, job_id)
             if not job:
                 return
             job.found_count = len(collected)
+            job.error = diagnostic
             db.commit()
-        for company in unique:
+
+        for company in selected:
             score: int | None = None
             notes: str | None = None
-            if mode == "audit_sites" and company["website"]:
-                score, notes = await audit_site(company["website"])
+            if mode == "audit_sites" and company.get("website"):
+                score, notes = await audit_site(str(company["website"]))
             lead = Lead(
                 job_id=job_id,
-                source_id=company["source_id"],
-                name=company["name"],
-                category=company["category"],
-                address=company["address"],
-                phones=", ".join(company["phones"]),
-                emails=", ".join(company["emails"]),
-                messengers=", ".join(company["messengers"]),
-                website=company["website"],
-                rating=company["rating"],
+                source_id=str(company.get("source_id") or ""),
+                name=str(company.get("name") or "Без названия"),
+                category=str(company.get("category") or ""),
+                address=str(company.get("address") or ""),
+                phones=", ".join(company.get("phones") or []),
+                emails=", ".join(company.get("emails") or []),
+                messengers=", ".join(company.get("messengers") or []),
+                website=company.get("website"),
+                rating=company.get("rating"),
                 audit_score=score,
                 audit_notes=notes,
                 draft_text=draft_for(company, score, notes),
@@ -523,14 +916,17 @@ async def run_job(job_id: int) -> None:
                 db.commit()
             if mode == "audit_sites":
                 await asyncio.sleep(0.15)
+
         with SessionLocal() as db:
             job = db.get(Job, job_id)
             if job:
                 job.status = "done"
-                job.saved_count = len(unique)
+                job.saved_count = len(selected)
                 job.finished_at = datetime.now(timezone.utc)
                 db.commit()
-        await telegram_notify(f"✅ Задача #{job_id} завершена\nСохранено лидов: {len(unique)}\nГород: {city}\nКатегории: {', '.join(categories)}")
+        await telegram_notify(
+            f"✅ Задача #{job_id} завершена\nИсточник: {source_label(source)}\nПолучено карточек: {len(collected)}\nСохранено: {len(selected)}\nГород: {city}\nКатегории: {', '.join(categories)}"
+        )
     except Exception as exc:
         message = str(exc)[:3000]
         with SessionLocal() as db:
