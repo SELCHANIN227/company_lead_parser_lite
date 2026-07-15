@@ -4,20 +4,22 @@ import asyncio
 import html
 import io
 import ipaddress
+import hashlib
 import json
 import os
 import re
 import secrets
 import socket
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from openpyxl import Workbook
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import Page, Response, TimeoutError as PlaywrightTimeoutError, async_playwright
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
@@ -35,6 +37,9 @@ def env(name: str, default: str = "") -> str:
 def env_bool(name: str, default: bool = False) -> bool:
     value = env(name, "true" if default else "false").lower()
     return value in {"1", "true", "yes", "on", "да"}
+
+
+DEBUG_DIR = Path(env("DEBUG_DIR", "/tmp/yandex-debug"))
 
 
 def normalize_database_url(url: str) -> str:
@@ -115,6 +120,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_db() -> Iterable[Session]:
@@ -225,7 +231,10 @@ def status_badge(status: str) -> str:
 
 def lead_source(lead: Lead) -> tuple[str, str]:
     if lead.source_id.startswith("yandex:"):
-        return "Яндекс", lead.source_id[len("yandex:") :]
+        candidate = lead.source_id[len("yandex:") :]
+        return "Яндекс", candidate if candidate.startswith(("http://", "https://")) else ""
+    if lead.source_id.startswith(("yandex-id:", "yandex-dom:")):
+        return "Яндекс", ""
     if lead.source_id.startswith("2gis:"):
         return "2ГИС", ""
     return "2ГИС", ""
@@ -318,7 +327,14 @@ def job_page(job_id: int, request: Request, db: Session = Depends(get_db)):
     if job.error:
         heading = "Ошибка" if job.status == "failed" else "Диагностика"
         cls = "bad" if job.status == "failed" else "warn"
-        diagnostic = f'<div class="card"><h3 class="{cls}">{heading}</h3><pre>{esc(job.error)}</pre></div>'
+        debug_links: list[str] = []
+        for path in sorted(DEBUG_DIR.glob(f"job-{job.id}-category-*.*")):
+            if path.suffix not in {".png", ".html"}:
+                continue
+            label = "Скриншот" if path.suffix == ".png" else "HTML страницы"
+            debug_links.append(f'<a class="button secondary" href="/jobs/{job.id}/debug/{esc(path.name)}" target="_blank">{label}</a>')
+        links_html = ("<div style=\"display:flex;gap:10px;flex-wrap:wrap;margin-top:12px\">" + "".join(debug_links) + "</div>") if debug_links else ""
+        diagnostic = f'<div class="card"><h3 class="{cls}">{heading}</h3><pre>{esc(job.error)}</pre>{links_html}</div>'
     refresh = 5 if job.status in {"pending", "running"} else None
     body = f"""<div class="card"><a href="/">← Назад</a><h2>Задача #{job.id}</h2>
 <div class="grid"><div>Город: <b>{esc(job.city)}</b></div><div>Источник: <b>{esc(source_label(source))}</b></div><div>Режим: <b>{esc(mode_label(mode))}</b></div><div>Статус: {status_badge(job.status)}</div><div>Получено карточек: <b>{job.found_count}</b></div><div>Сохранено: <b>{job.saved_count}</b></div></div>
@@ -350,6 +366,18 @@ def export_job(job_id: int, request: Request, db: Session = Depends(get_db)):
     wb.save(output)
     output.seek(0)
     return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="leads-{job_id}.xlsx"'})
+
+
+@app.get("/jobs/{job_id}/debug/{filename}")
+def job_debug_file(job_id: int, filename: str, request: Request):
+    require_login(request)
+    if not re.fullmatch(rf"job-{job_id}-category-\d+\.(?:png|html)", filename):
+        raise HTTPException(404, "Файл диагностики не найден")
+    path = DEBUG_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, "Файл диагностики не найден")
+    media_type = "image/png" if path.suffix == ".png" else "text/html"
+    return FileResponse(path, media_type=media_type, filename=filename)
 
 
 def clean_list(values: Iterable[str]) -> list[str]:
@@ -447,7 +475,16 @@ async def search_twogis(city: str, category: str, has_site: bool | None, limit: 
 
 def yandex_captcha_text(text: str) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in ["проверка, что вы не робот", "подтвердите, что запросы отправляли вы", "введите символы", "captcha"])
+    return any(
+        marker in lowered
+        for marker in [
+            "проверка, что вы не робот",
+            "подтвердите, что запросы отправляли вы",
+            "введите символы",
+            "showcaptcha",
+            "captcha",
+        ]
+    )
 
 
 async def page_has_captcha(page: Page) -> bool:
@@ -457,11 +494,11 @@ async def page_has_captcha(page: Page) -> bool:
         text = await page.locator("body").inner_text(timeout=3000)
     except Exception:
         return False
-    return yandex_captcha_text(text[:8000])
+    return yandex_captcha_text(text[:12000])
 
 
 async def close_yandex_popups(page: Page) -> None:
-    for label in ["Принять", "Хорошо", "Понятно", "Закрыть", "Не сейчас"]:
+    for label in ["Принять", "Хорошо", "Понятно", "Закрыть", "Не сейчас", "Разрешить"]:
         try:
             button = page.get_by_role("button", name=re.compile(label, re.I)).first
             if await button.count() and await button.is_visible():
@@ -472,49 +509,22 @@ async def close_yandex_popups(page: Page) -> None:
 
 
 def canonical_yandex_org_url(base_url: str, href: str) -> str:
+    href = unquote(str(href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("ymapsbm1://"):
+        parsed_custom = urlparse(href)
+        oid = (parse_qs(parsed_custom.query).get("oid") or [""])[0]
+        return f"https://yandex.ru/maps/org/{oid}" if oid else ""
     absolute = urljoin(base_url, href)
     parsed = urlparse(absolute)
-    if "/org/" not in parsed.path:
-        return ""
-    return urlunparse((parsed.scheme or "https", parsed.netloc or "yandex.ru", parsed.path.rstrip("/"), "", "", ""))
-
-
-async def collect_yandex_org_links(page: Page, limit: int) -> list[str]:
-    links: list[str] = []
-    seen: set[str] = set()
-    stable_rounds = 0
-    for _ in range(35):
-        try:
-            hrefs = await page.locator('a[href*="/org/"]').evaluate_all("els => els.map(e => e.getAttribute('href')).filter(Boolean)")
-        except Exception:
-            hrefs = []
-        before = len(links)
-        for href in hrefs:
-            url = canonical_yandex_org_url(page.url, str(href))
-            if url and url not in seen:
-                seen.add(url)
-                links.append(url)
-                if len(links) >= limit:
-                    return links
-        stable_rounds = stable_rounds + 1 if len(links) == before else 0
-        if stable_rounds >= 5:
-            break
-        scrolled = False
-        for selector in ['[class*="scroll__container"]', '[class*="search-list-view"]', '[class*="search-list-view__list"]']:
-            try:
-                locator = page.locator(selector).first
-                if await locator.count() and await locator.is_visible():
-                    await locator.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-                    scrolled = True
-                    break
-            except Exception:
-                pass
-        if not scrolled:
-            await page.mouse.wheel(0, 1800)
-        await page.wait_for_timeout(900)
-        if await page_has_captcha(page):
-            raise RuntimeError("Яндекс показал CAPTCHA. Автоматический обход отключён; повтори позже или запускай меньший объём.")
-    return links[:limit]
+    if "/org/" in parsed.path:
+        return urlunparse((parsed.scheme or "https", parsed.netloc or "yandex.ru", parsed.path.rstrip("/"), "", "", ""))
+    query = parse_qs(parsed.query)
+    oid = (query.get("oid") or query.get("orgpage") or [""])[0]
+    if oid:
+        return f"https://yandex.ru/maps/org/{oid}"
+    return ""
 
 
 def walk_json(value: Any) -> Iterable[Any]:
@@ -525,6 +535,376 @@ def walk_json(value: Any) -> Iterable[Any]:
     elif isinstance(value, list):
         for nested in value:
             yield from walk_json(nested)
+
+
+def clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def yandex_card_url_from_meta(meta: dict[str, Any], node: dict[str, Any]) -> str:
+    candidates = [
+        meta.get("uri"),
+        node.get("uri"),
+        (node.get("properties") or {}).get("uri") if isinstance(node.get("properties"), dict) else None,
+    ]
+    for candidate in candidates:
+        url = canonical_yandex_org_url(YANDEX_MAPS_URL, str(candidate or ""))
+        if url:
+            return url
+    oid = clean_text(meta.get("id") or meta.get("oid") or node.get("id"))
+    if oid and re.search(r"\d", oid):
+        return f"https://yandex.ru/maps/org/{oid}"
+    return ""
+
+
+def values_from_objects(value: Any, keys: set[str]) -> list[str]:
+    result: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() in keys and isinstance(nested, (str, int, float)):
+                result.append(clean_text(nested))
+            result.extend(values_from_objects(nested, keys))
+    elif isinstance(value, list):
+        for nested in value:
+            result.extend(values_from_objects(nested, keys))
+    return clean_list(result)
+
+
+def yandex_company_from_node(node: dict[str, Any], fallback_category: str, city: str) -> dict[str, Any] | None:
+    properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    meta = properties.get("CompanyMetaData") if isinstance(properties.get("CompanyMetaData"), dict) else None
+    if meta is None and isinstance(node.get("CompanyMetaData"), dict):
+        meta = node.get("CompanyMetaData")
+    if meta is None:
+        # Некоторые ответы кладут карточку без обёртки CompanyMetaData.
+        probable_name = clean_text(node.get("name") or properties.get("name") or node.get("title"))
+        probable_address = clean_text(node.get("address") or properties.get("description") or properties.get("address"))
+        has_business_fields = any(key in node for key in ["phones", "Phones", "categories", "Categories", "ratingData", "workingTime"])
+        if not probable_name or not (probable_address or has_business_fields):
+            return None
+        meta = node
+
+    name = clean_text(meta.get("name") or properties.get("name") or node.get("name") or node.get("title"))
+    if not name or name.lower() in {"без названия", "яндекс карты", "карты"}:
+        return None
+
+    address_value = meta.get("address") or properties.get("description") or properties.get("address") or node.get("address")
+    address = clean_text(address_value) or city
+
+    categories_raw = meta.get("Categories") or meta.get("categories") or node.get("categories") or []
+    categories: list[str] = []
+    if isinstance(categories_raw, list):
+        for item in categories_raw:
+            if isinstance(item, dict):
+                categories.append(clean_text(item.get("name") or item.get("class") or item.get("id")))
+            else:
+                categories.append(clean_text(item))
+    category = ", ".join(clean_list(categories)) or fallback_category
+
+    phone_values = values_from_objects(meta.get("Phones") or meta.get("phones") or [], {"formatted", "number", "value", "phone"})
+    phones = clean_list(normalize_phone(value) for value in phone_values)
+    email_values = values_from_objects(meta.get("Emails") or meta.get("emails") or [], {"value", "email", "address"})
+    emails = clean_list(value.lower() for value in email_values if "@" in value)
+
+    websites: list[str] = []
+    for key in ["url", "website", "site"]:
+        value = meta.get(key)
+        if isinstance(value, str):
+            target = external_target(value) or normalize_url(value)
+            if target and "yandex." not in (urlparse(target).hostname or ""):
+                websites.append(target)
+    links_raw = meta.get("Links") or meta.get("links") or []
+    if isinstance(links_raw, list):
+        for item in links_raw:
+            if isinstance(item, dict):
+                href = clean_text(item.get("href") or item.get("url") or item.get("value"))
+                target = external_target(href) or (normalize_url(href) if href else "")
+                if target and "yandex." not in (urlparse(target).hostname or ""):
+                    websites.append(target)
+
+    messengers: list[str] = []
+    for target in list(websites):
+        host = (urlparse(target).hostname or "").lower()
+        if host in {"t.me", "telegram.me", "wa.me", "api.whatsapp.com", "vk.com", "viber.com"}:
+            messengers.append(target)
+            websites.remove(target)
+
+    rating: float | None = None
+    rating_candidates = [
+        properties.get("rating"),
+        meta.get("rating"),
+        (properties.get("ratingData") or {}).get("rating") if isinstance(properties.get("ratingData"), dict) else None,
+        (meta.get("ratingData") or {}).get("rating") if isinstance(meta.get("ratingData"), dict) else None,
+    ]
+    for raw in rating_candidates:
+        try:
+            if raw is not None and str(raw).strip():
+                rating = float(str(raw).replace(",", "."))
+                break
+        except ValueError:
+            pass
+
+    card_url = yandex_card_url_from_meta(meta, node)
+    stable_id = clean_text(meta.get("id") or meta.get("oid") or node.get("id"))
+    if card_url:
+        source_id = "yandex:" + card_url
+    elif stable_id:
+        source_id = "yandex-id:" + stable_id
+    else:
+        digest = hashlib.sha1(f"{name}|{address}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+        source_id = "yandex-dom:" + digest
+
+    return {
+        "source": "yandex",
+        "source_id": source_id,
+        "name": name,
+        "category": category,
+        "address": address,
+        "phones": phones,
+        "emails": emails,
+        "messengers": clean_list(messengers),
+        "website": next(iter(clean_list(websites)), None),
+        "rating": rating,
+        "card_url": card_url,
+    }
+
+
+def parse_yandex_payload(payload: Any, fallback_category: str, city: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for nested in walk_json(payload):
+        if not isinstance(nested, dict):
+            continue
+        record = yandex_company_from_node(nested, fallback_category, city)
+        if not record:
+            continue
+        key = record["source_id"] or f"{record['name'].lower()}|{record['address'].lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(record)
+    return records
+
+
+class YandexResponseCapture:
+    def __init__(self, fallback_category: str, city: str) -> None:
+        self.fallback_category = fallback_category
+        self.city = city
+        self.records: list[dict[str, Any]] = []
+        self.json_responses = 0
+        self.total_responses = 0
+        self.candidate_urls: list[str] = []
+        self.tasks: list[asyncio.Task[Any]] = []
+
+    def schedule(self, response: Response) -> None:
+        self.total_responses += 1
+        task = asyncio.create_task(self._consume(response))
+        self.tasks.append(task)
+
+    async def finish(self) -> None:
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def _consume(self, response: Response) -> None:
+        url = response.url
+        if "yandex." not in url:
+            return
+        content_type = (response.headers.get("content-type") or "").lower()
+        likely = any(token in url.lower() for token in ["search", "discovery", "business", "org", "maps/api"])
+        if "json" not in content_type and not likely:
+            return
+        try:
+            body = await response.body()
+        except Exception:
+            return
+        if not body or len(body) > 8_000_000:
+            return
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        self.json_responses += 1
+        if likely and len(self.candidate_urls) < 20:
+            self.candidate_urls.append(url[:500])
+        self.records.extend(parse_yandex_payload(payload, self.fallback_category, self.city))
+
+
+async def first_text(page: Page, selectors: list[str]) -> str:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() and await locator.is_visible():
+                text = (await locator.inner_text(timeout=1500)).strip()
+                if text:
+                    return re.sub(r"\s+", " ", text)
+        except Exception:
+            pass
+    return ""
+
+
+async def save_yandex_debug(page: Page, job_id: int, category_index: int) -> tuple[Path | None, Path | None]:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"job-{job_id}-category-{category_index}"
+    screenshot_path = DEBUG_DIR / f"{stem}.png"
+    html_path = DEBUG_DIR / f"{stem}.html"
+    try:
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+    except Exception:
+        screenshot_path = None
+    try:
+        source = await page.content()
+        html_path.write_text(source[:5_000_000], encoding="utf-8")
+    except Exception:
+        html_path = None
+    return screenshot_path, html_path
+
+
+async def collect_yandex_org_links(page: Page, limit: int) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+    selectors = [
+        'a[href*="/org/"]',
+        'a[href*="oid="]',
+        '[class*="search-business-snippet-view"] a[href]',
+        '[class*="business-snippet-view"] a[href]',
+        '[data-testid*="search-result"] a[href]',
+    ]
+    stable_rounds = 0
+    for _ in range(24):
+        before = len(links)
+        for selector in selectors:
+            try:
+                hrefs = await page.locator(selector).evaluate_all(
+                    "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)"
+                )
+            except Exception:
+                hrefs = []
+            for href in hrefs:
+                url = canonical_yandex_org_url(page.url, str(href))
+                if url and url not in seen:
+                    seen.add(url)
+                    links.append(url)
+                    if len(links) >= limit:
+                        return links
+        stable_rounds = stable_rounds + 1 if len(links) == before else 0
+        if stable_rounds >= 4:
+            break
+        scrolled = False
+        for selector in [
+            '[class*="scroll__container"]',
+            '[class*="search-list-view"]',
+            '[class*="search-list-view__list"]',
+            '[class*="sidebar-panel"]',
+        ]:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    await locator.evaluate("el => { el.scrollTop = Math.min(el.scrollHeight, el.scrollTop + 1400); }")
+                    scrolled = True
+                    break
+            except Exception:
+                pass
+        if not scrolled:
+            await page.mouse.wheel(0, 1400)
+        await page.wait_for_timeout(1000)
+        if await page_has_captcha(page):
+            raise RuntimeError("Яндекс показал CAPTCHA. Автоматический обход отключён; повтори позже.")
+    return links[:limit]
+
+
+async def collect_yandex_dom_cards(page: Page, fallback_category: str, city: str, limit: int) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    card_selectors = [
+        '[class*="search-business-snippet-view"]',
+        '[class*="business-snippet-view"]',
+        '[class*="search-snippet-view"]',
+        '[data-testid*="search-result"]',
+    ]
+    for selector in card_selectors:
+        try:
+            cards = page.locator(selector)
+            count = min(await cards.count(), limit * 3)
+        except Exception:
+            continue
+        for index in range(count):
+            card = cards.nth(index)
+            try:
+                if not await card.is_visible():
+                    continue
+                text = clean_text(await card.inner_text(timeout=1500))
+            except Exception:
+                continue
+            if not text or len(text) < 3:
+                continue
+            try:
+                href = await card.locator("a[href]").first.get_attribute("href", timeout=1000)
+            except Exception:
+                href = ""
+            card_url = canonical_yandex_org_url(page.url, href or "")
+            try:
+                name = clean_text(await card.locator('[class*="title"], h2, h3, a').first.inner_text(timeout=1000))
+            except Exception:
+                name = text.split(" ", 12)[0:6]
+                name = " ".join(name)
+            if not name:
+                continue
+            phone_matches = re.findall(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}", text)
+            phones = clean_list(normalize_phone(value) for value in phone_matches)
+            rating: float | None = None
+            rating_match = re.search(r"(?<!\d)([1-5][\.,]\d)(?!\d)", text)
+            if rating_match:
+                try:
+                    rating = float(rating_match.group(1).replace(",", "."))
+                except ValueError:
+                    pass
+            source_id = "yandex:" + card_url if card_url else "yandex-dom:" + hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            records.append(
+                {
+                    "source": "yandex",
+                    "source_id": source_id,
+                    "name": name,
+                    "category": fallback_category,
+                    "address": city,
+                    "phones": phones,
+                    "emails": [],
+                    "messengers": [],
+                    "website": None,
+                    "rating": rating,
+                    "card_url": card_url,
+                }
+            )
+            if len(records) >= limit:
+                return records
+    return records
+
+
+def merge_company_records(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key in ["name", "category", "address", "website", "rating", "card_url"]:
+        if not result.get(key) and extra.get(key):
+            result[key] = extra[key]
+    for key in ["phones", "emails", "messengers"]:
+        result[key] = clean_list([*(result.get(key) or []), *(extra.get(key) or [])])
+    if str(result.get("name", "")).startswith("Карточка не") and extra.get("name"):
+        result["name"] = extra["name"]
+    return result
+
+
+def deduplicate_company_dicts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = str(record.get("source_id") or "")
+        if not key:
+            key = f"{clean_text(record.get('name')).lower()}|{clean_text(record.get('address')).lower()}"
+        if key in merged:
+            merged[key] = merge_company_records(merged[key], record)
+        else:
+            merged[key] = record
+    return list(merged.values())
 
 
 def jsonld_org_data(values: list[Any]) -> dict[str, Any]:
@@ -568,22 +948,13 @@ def external_target(href: str) -> str:
     return absolute
 
 
-async def first_text(page: Page, selectors: list[str]) -> str:
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count() and await locator.is_visible():
-                text = (await locator.inner_text(timeout=1500)).strip()
-                if text:
-                    return re.sub(r"\s+", " ", text)
-        except Exception:
-            pass
-    return ""
-
-
 async def extract_yandex_card(page: Page, card_url: str, fallback_category: str, city: str) -> dict[str, Any]:
     await page.goto(card_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2200)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(1200)
     await close_yandex_popups(page)
     if await page_has_captcha(page):
         raise RuntimeError("Яндекс показал CAPTCHA при открытии карточки. Обход CAPTCHA отключён.")
@@ -593,7 +964,7 @@ async def extract_yandex_card(page: Page, card_url: str, fallback_category: str,
             button = page.locator(selector).first
             if await button.count() and await button.is_visible():
                 await button.click(timeout=1800)
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(500)
                 break
         except Exception:
             pass
@@ -610,7 +981,7 @@ async def extract_yandex_card(page: Page, card_url: str, fallback_category: str,
         pass
     structured = jsonld_org_data(json_values)
 
-    name = str(structured.get("name") or "").strip()
+    name = clean_text(structured.get("name"))
     if not name:
         name = await first_text(page, ['h1', '[class*="orgpage-header-view__header"]', '[class*="business-card-title-view__title"]'])
     if not name:
@@ -620,9 +991,7 @@ async def extract_yandex_card(page: Page, card_url: str, fallback_category: str,
     address = format_address(structured.get("address"))
     if not address:
         address = await first_text(page, ['[class*="business-contacts-view__address-link"]', '[class*="orgpage-header-view__address"]', '[class*="business-card-title-view__address"]', '[itemprop="address"]'])
-
-    category = await first_text(page, ['[class*="business-card-title-view__categories"]', '[class*="orgpage-header-view__category"]', '[class*="orgpage-categories-info-view"]'])
-    category = category or fallback_category
+    category = await first_text(page, ['[class*="business-card-title-view__categories"]', '[class*="orgpage-header-view__category"]', '[class*="orgpage-categories-info-view"]']) or fallback_category
 
     phones: list[str] = []
     telephone = structured.get("telephone")
@@ -702,47 +1071,124 @@ async def extract_yandex_card(page: Page, card_url: str, fallback_category: str,
         "messengers": clean_list(messengers),
         "website": next(iter(clean_list(websites)), None),
         "rating": rating,
+        "card_url": card_url,
     }
 
 
-async def search_yandex_categories(city: str, categories: list[str], limit: int) -> list[dict[str, Any]]:
+async def search_yandex_categories(job_id: int, city: str, categories: list[str], limit: int) -> tuple[list[dict[str, Any]], str]:
     collected: list[dict[str, Any]] = []
+    diagnostic_lines: list[str] = []
     async with YANDEX_BROWSER_LOCK:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-zygote",
-                ],
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
-            context = await browser.new_context(locale="ru-RU", viewport={"width": 1365, "height": 900})
+            context = await browser.new_context(
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                viewport={"width": 1440, "height": 1000},
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7"},
+            )
             search_page = await context.new_page()
             detail_page = await context.new_page()
             try:
-                for category in categories:
-                    search_url = f"{YANDEX_MAPS_URL}?text={quote_plus(category + ' ' + city)}"
+                for category_index, category in enumerate(categories, start=1):
+                    capture = YandexResponseCapture(category, city)
+                    search_page.on("response", capture.schedule)
+                    search_url = f"{YANDEX_MAPS_URL}?mode=search&text={quote_plus(category + ' ' + city)}"
                     await search_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                    await search_page.wait_for_timeout(3500)
+                    try:
+                        await search_page.wait_for_load_state("networkidle", timeout=12000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    await search_page.wait_for_timeout(1800)
                     await close_yandex_popups(search_page)
                     if await page_has_captcha(search_page):
-                        raise RuntimeError("Яндекс показал CAPTCHA. Обход отключён; подожди и запусти меньший объём.")
+                        screenshot_path, html_path = await save_yandex_debug(search_page, job_id, category_index)
+                        raise RuntimeError(
+                            "Яндекс показал CAPTCHA. Обход отключён. "
+                            f"Диагностика: {screenshot_path or '-'}, {html_path or '-'}"
+                        )
+
                     links = await collect_yandex_org_links(search_page, limit)
-                    if not links and "/org/" in search_page.url:
-                        links = [canonical_yandex_org_url(search_page.url, search_page.url)]
-                    for card_url in links:
+                    dom_records = await collect_yandex_dom_cards(search_page, category, city, limit)
+                    await capture.finish()
+                    response_records = deduplicate_company_dicts(capture.records)
+                    category_records = deduplicate_company_dicts([*response_records, *dom_records])
+
+                    # Детальные карточки обогащают телефон и сайт. Открываем сначала найденные ссылки,
+                    # затем ссылки, полученные из JSON-ответов.
+                    detail_links = list(links)
+                    for record in category_records:
+                        card_url = str(record.get("card_url") or "")
+                        if card_url and card_url not in detail_links:
+                            detail_links.append(card_url)
+                    enriched: list[dict[str, Any]] = []
+                    for card_url in detail_links[:limit]:
                         try:
-                            collected.append(await extract_yandex_card(detail_page, card_url, category, city))
+                            enriched.append(await extract_yandex_card(detail_page, card_url, category, city))
                         except PlaywrightTimeoutError:
-                            collected.append({"source": "yandex", "source_id": "yandex:" + card_url, "name": "Карточка не загрузилась", "category": category, "address": city, "phones": [], "emails": [], "messengers": [], "website": None, "rating": None})
-                        await detail_page.wait_for_timeout(450)
+                            enriched.append(
+                                {
+                                    "source": "yandex",
+                                    "source_id": "yandex:" + card_url,
+                                    "name": "Карточка не загрузилась",
+                                    "category": category,
+                                    "address": city,
+                                    "phones": [],
+                                    "emails": [],
+                                    "messengers": [],
+                                    "website": None,
+                                    "rating": None,
+                                    "card_url": card_url,
+                                }
+                            )
+                        await detail_page.wait_for_timeout(350)
+                    category_records = deduplicate_company_dicts([*category_records, *enriched])[:limit]
+
+                    title = clean_text(await search_page.title())
+                    body_preview = ""
+                    try:
+                        body_preview = clean_text((await search_page.locator("body").inner_text(timeout=3000))[:1500])
+                    except Exception:
+                        pass
+                    diagnostic_lines.extend(
+                        [
+                            f"Категория: {category}",
+                            f"URL: {search_page.url}",
+                            f"Заголовок: {title or '-'}",
+                            f"JSON-ответов: {capture.json_responses} из {capture.total_responses}",
+                            f"Карточек из JSON: {len(response_records)}",
+                            f"Карточек из DOM: {len(dom_records)}",
+                            f"Ссылок на /org/: {len(links)}",
+                            f"Итог по категории: {len(category_records)}",
+                        ]
+                    )
+                    if not category_records:
+                        screenshot_path, html_path = await save_yandex_debug(search_page, job_id, category_index)
+                        diagnostic_lines.extend(
+                            [
+                                f"Скриншот: /jobs/{job_id}/debug/{screenshot_path.name}" if screenshot_path else "Скриншот: не сохранён",
+                                f"HTML: /jobs/{job_id}/debug/{html_path.name}" if html_path else "HTML: не сохранён",
+                                f"Текст страницы: {body_preview or '-'}",
+                            ]
+                        )
+                    collected.extend(category_records)
+                    search_page.remove_listener("response", capture.schedule)
             finally:
                 await context.close()
                 await browser.close()
-    return collected
+
+    collected = deduplicate_company_dicts(collected)
+    diagnostic = "\n".join(diagnostic_lines)
+    if not collected:
+        raise RuntimeError(
+            "Яндекс не вернул ни одной распознаваемой карточки. Это не означает, что компаний нет.\n\n"
+            + diagnostic
+        )
+    return collected, diagnostic
 
 
 def hostname_is_public(hostname: str) -> bool:
@@ -880,9 +1326,10 @@ async def run_job(job_id: int) -> None:
             for category in categories:
                 collected.extend(await search_twogis(city, category, has_site=has_site, limit=limit))
         else:
-            collected = await search_yandex_categories(city, categories, limit=min(30, limit))
+            collected, source_diagnostic = await search_yandex_categories(job_id, city, categories, limit=min(30, limit))
 
-        selected, diagnostic = deduplicate_and_filter(collected, mode)
+        selected, filter_diagnostic = deduplicate_and_filter(collected, mode)
+        diagnostic = filter_diagnostic if source == "twogis" else source_diagnostic + "\n\n--- Фильтр ---\n" + filter_diagnostic
         with SessionLocal() as db:
             job = db.get(Job, job_id)
             if not job:
